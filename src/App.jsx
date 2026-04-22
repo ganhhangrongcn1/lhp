@@ -657,6 +657,8 @@ export default function App() {
   const unseenOrderIdsRef = useRef([]);
   const knownOrderIdsRef = useRef(new Set());
   const hasUserInteractedRef = useRef(false);
+  const audioUnlockedRef = useRef(false);
+  const unlockingAudioRef = useRef(false);
 
   const [viewport, setViewport] = useState({
     width: typeof window !== "undefined" ? window.innerWidth : 1024,
@@ -669,15 +671,28 @@ export default function App() {
   const bodyHeight = `calc(100vh - ${headerHeight + 18}px)`;
   const rightMainHeight = `calc(100vh - ${headerHeight + 34}px)`;
 
-  async function unlockAudio() {
+  async function unlockAudio(forceEnable = false) {
     try {
       if (!audioRef.current) return false;
+      if (unlockingAudioRef.current) return false;
 
+      unlockingAudioRef.current = true;
       hasUserInteractedRef.current = true;
 
-      audioRef.current.loop = false;
-      audioRef.current.volume = Math.max(0.15, Math.min(soundVolume * 4, 1));
+      if (forceEnable) {
+        setSoundEnabled(true);
+        if (typeof window !== "undefined") {
+          window.localStorage.setItem("kitchen_sound_enabled", "1");
+        }
+      }
+
+      const volume = Math.max(0.15, Math.min(soundVolume * 4, 1));
+
+      audioRef.current.pause();
       audioRef.current.currentTime = 0;
+      audioRef.current.loop = false;
+      audioRef.current.volume = volume;
+      audioRef.current.muted = false;
 
       const playPromise = audioRef.current.play();
       if (playPromise && typeof playPromise.then === "function") {
@@ -687,16 +702,18 @@ export default function App() {
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
 
-      setSoundEnabled(true);
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem("kitchen_sound_enabled", "1");
-      }
+      audioUnlockedRef.current = true;
       setError("");
       return true;
     } catch (err) {
-      setSoundEnabled(false);
-      setError("Trình duyệt đang chặn âm thanh. Hãy bấm nút Bật chuông 1 lần.");
+      audioUnlockedRef.current = false;
+      if (forceEnable) {
+        setSoundEnabled(false);
+      }
+      setError("Trình duyệt đang chặn âm thanh. Chạm 1 lần vào màn hình hoặc bấm Bật chuông.");
       return false;
+    } finally {
+      unlockingAudioRef.current = false;
     }
   }
 
@@ -728,22 +745,29 @@ export default function App() {
   async function playNewOrderSound() {
     if (!soundEnabled) return;
     if (!audioRef.current) return;
-    if (!hasUserInteractedRef.current) return;
 
     try {
+      if (!audioUnlockedRef.current) {
+        const ok = await unlockAudio();
+        if (!ok) return;
+      }
+
       const volume = Math.max(0.15, Math.min(soundVolume * 4, 1));
+
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
       audioRef.current.loop = false;
       audioRef.current.volume = volume;
+      audioRef.current.muted = false;
 
       const playPromise = audioRef.current.play();
       if (playPromise && typeof playPromise.then === "function") {
         await playPromise;
       }
     } catch (err) {
+      audioUnlockedRef.current = false;
       console.log("Không phát được chuông:", err);
-      setError("Chuông bị trình duyệt chặn. Hãy bấm Bật chuông lại 1 lần.");
+      setError("Chuông chưa được mở khóa. Chạm 1 lần vào màn hình hoặc bấm Bật chuông.");
     }
   }
 
@@ -762,11 +786,15 @@ export default function App() {
   async function startContinuousRinging() {
     if (!soundEnabled) return;
     if (!audioRef.current) return;
-    if (!hasUserInteractedRef.current) return;
+
+    if (!unseenOrderIdsRef.current || unseenOrderIdsRef.current.length === 0) {
+      return;
+    }
+
     if (isRingingRef.current) return;
 
     isRingingRef.current = true;
-    const GAP_MS = 2200;
+    const GAP_MS = 1400;
 
     const playLoop = async () => {
       if (!isRingingRef.current || !soundEnabled || !audioRef.current) return;
@@ -779,8 +807,8 @@ export default function App() {
       await playNewOrderSound();
 
       const durationMs = Math.max(
-        1200,
-        Math.floor((audioRef.current.duration || 2) * 1000)
+        1000,
+        Math.floor((audioRef.current.duration || 1.6) * 1000)
       );
 
       ringingTimeoutRef.current = setTimeout(() => {
@@ -788,7 +816,7 @@ export default function App() {
       }, durationMs + GAP_MS);
     };
 
-    playLoop();
+    await playLoop();
   }
 
   function markOrderAsSeen(orderId) {
@@ -834,15 +862,24 @@ export default function App() {
       setUnseenOrderIds((prev) => {
         const exists = prev.some((id) => String(id) === orderId);
         const next = exists ? prev : [...prev, orderId];
-        unseenOrderIdsRef.current = next;
 
+        unseenOrderIdsRef.current = next;
         setNewOrderCount(next.length);
-        if (next.length > 0) startTitleFlash(next.length);
+
+        if (next.length > 0) {
+          startTitleFlash(next.length);
+
+          if (soundEnabled) {
+            setTimeout(() => {
+              if (unseenOrderIdsRef.current.length > 0) {
+                startContinuousRinging();
+              }
+            }, 0);
+          }
+        }
 
         return next;
       });
-
-      await startContinuousRinging();
     }
 
     setOrders((prev) => {
@@ -873,7 +910,27 @@ export default function App() {
     audioRef.current = new Audio(tingSound);
     audioRef.current.preload = "auto";
     audioRef.current.playbackRate = 1.08;
+    audioRef.current.muted = false;
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const handleFirstUserGesture = async () => {
+      if (audioUnlockedRef.current) return;
+      await unlockAudio();
+    };
+
+    window.addEventListener("pointerdown", handleFirstUserGesture, { passive: true });
+    window.addEventListener("touchstart", handleFirstUserGesture, { passive: true });
+    window.addEventListener("keydown", handleFirstUserGesture);
+
+    return () => {
+      window.removeEventListener("pointerdown", handleFirstUserGesture);
+      window.removeEventListener("touchstart", handleFirstUserGesture);
+      window.removeEventListener("keydown", handleFirstUserGesture);
+    };
+  }, [soundVolume]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -887,9 +944,14 @@ export default function App() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+
     const savedEnabled = window.localStorage.getItem("kitchen_sound_enabled") === "1";
     if (savedEnabled) {
       setSoundEnabled(true);
+
+      setTimeout(() => {
+        unlockAudio();
+      }, 300);
     }
   }, []);
 
@@ -1351,6 +1413,7 @@ export default function App() {
           fontFamily: "Arial, sans-serif",
           padding: 8,
           boxSizing: "border-box",
+          position: "relative",
         }}
       >
         <div
@@ -1360,9 +1423,19 @@ export default function App() {
             display: "grid",
             gridTemplateRows: `146px 1fr`,
             gap: 10,
+            overflow: "hidden",
           }}
         >
-          <Card style={{ overflow: "hidden" }}>
+          <Card
+            style={{
+              overflow: "hidden",
+              position: "sticky",
+              top: 0,
+              zIndex: 30,
+              background: "#ffffff",
+              boxShadow: "0 6px 18px rgba(15,23,42,0.08)",
+            }}
+          >
             <CardContent
               style={{
                 padding: 10,
@@ -1447,7 +1520,7 @@ export default function App() {
                         return;
                       }
 
-                      const ok = await unlockAudio();
+                      const ok = await unlockAudio(true);
                       if (ok && unseenOrderIdsRef.current.length > 0) {
                         await startContinuousRinging();
                       }
